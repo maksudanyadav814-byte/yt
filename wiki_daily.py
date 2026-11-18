@@ -8,9 +8,10 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import requests
 
 TOKEN = os.environ["BOT_TOKEN"]
-CHAT_ID = os.environ["CHAT_ID"]
+CHAT_ID = str(os.environ["CHAT_ID"])
 SEND_HOUR = int(os.environ.get("SEND_HOUR", "8"))      # IST me ghanta
 SEND_MINUTE = int(os.environ.get("SEND_MINUTE", "0"))  # IST me minute
+STARTUP_MSG = os.environ.get("STARTUP_MSG", "1") == "1"  # "0" kar do to start par hi nahi bolega
 
 TG = f"https://api.telegram.org/bot{TOKEN}"
 HEADERS = {"User-Agent": "StoryVideoBot/1.0 (your_email@example.com)"}  # apna asli email
@@ -41,6 +42,15 @@ LANGS = {
 
 last_sent_date = None
 sent_ids = {"hi": set(), "en": set()}   # restart par reset hota hai
+send_lock = threading.Lock()            # ek time par ek hi batch jaye
+
+HELP_TEXT = (
+    "Hi! 👋 Main aapka Story Topic Bot hu.\n\n"
+    "Commands:\n"
+    "/new - abhi naye topics (5 Hindi + 5 English)\n"
+    "/start - ye message dobara\n\n"
+    f"Roz subah {SEND_HOUR:02d}:{SEND_MINUTE:02d} IST par topics apne aap aate hain."
+)
 
 
 def fetch(lang, keyword, offset):
@@ -94,17 +104,83 @@ def send(text):
 
 
 def send_daily_topics():
-    for lang in ("hi", "en"):
-        topics = get_topics(lang, 5)
-        if not topics:
-            send(f"{LANGS[lang]['heading']}: aaj kuch nahi mila.")
-            continue
-        send(f"{LANGS[lang]['heading']}")
-        for i, p in enumerate(topics, 1):
-            info = (p.get("extract") or "").strip()[:450]
-            send(f"{i}. {p['title']}\n\n{info}\n\n{p['fullurl']}")
-            sent_ids[lang].add(p["pageid"])
-            time.sleep(0.5)
+    with send_lock:
+        for lang in ("hi", "en"):
+            topics = get_topics(lang, 5)
+            if not topics:
+                send(f"{LANGS[lang]['heading']}: aaj kuch nahi mila.")
+                continue
+            send(f"{LANGS[lang]['heading']}")
+            for i, p in enumerate(topics, 1):
+                info = (p.get("extract") or "").strip()[:450]
+                send(f"{i}. {p['title']}\n\n{info}\n\n{p['fullurl']}")
+                sent_ids[lang].add(p["pageid"])
+                time.sleep(0.5)
+
+
+def handle_new():
+    """/new command: naye topics bhejo (background thread me chalta hai)."""
+    try:
+        send_daily_topics()
+    except Exception as e:
+        print("handle_new error:", e)
+        try:
+            send("⚠️ Kuch gadbad ho gayi, thodi der baad /new try karo.")
+        except Exception:
+            pass
+
+
+def handle_message(text):
+    parts = text.strip().split()
+    if not parts:
+        return
+    cmd = parts[0].split("@")[0].lower()   # /new@MyBot -> /new
+
+    if cmd in ("/start", "/help", "hi", "hello", "hii", "namaste"):
+        send(HELP_TEXT)
+    elif cmd == "/new":
+        if send_lock.locked():
+            send("⏳ Abhi topics bhej raha hu, thoda ruko.")
+        else:
+            send("🔄 Naye topics la raha hu...")
+            threading.Thread(target=handle_new, daemon=True).start()
+
+
+def poll_updates():
+    """Telegram se messages sunta hai (long polling)."""
+    # agar kabhi webhook set tha to getUpdates nahi chalega, isliye hata do
+    try:
+        requests.get(f"{TG}/deleteWebhook", timeout=15)
+    except Exception as e:
+        print("deleteWebhook error:", e)
+
+    offset = None
+    # bot band tha tab ke purane messages skip karo
+    try:
+        r = requests.get(f"{TG}/getUpdates", params={"offset": -1}, timeout=15).json()
+        res = r.get("result", [])
+        if res:
+            offset = res[-1]["update_id"] + 1
+    except Exception as e:
+        print("initial getUpdates error:", e)
+
+    while True:
+        try:
+            params = {"timeout": 30}
+            if offset is not None:
+                params["offset"] = offset
+            r = requests.get(f"{TG}/getUpdates", params=params, timeout=40)
+            r.raise_for_status()
+            for upd in r.json().get("result", []):
+                offset = upd["update_id"] + 1
+                msg = upd.get("message") or {}
+                chat = str(msg.get("chat", {}).get("id", ""))
+                if chat != CHAT_ID:          # sirf aapki chat ka command chalega
+                    continue
+                handle_message(msg.get("text", ""))
+        except Exception as e:
+            print("Poll error:", e)
+            time.sleep(5)
 
 
 def scheduler():
@@ -144,7 +220,14 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    if STARTUP_MSG:
+        try:
+            send("Hi! 👋 Bot chalu ho gaya.\n\nNaye topics ke liye /new bhejo.")
+        except Exception as e:
+            print("Startup msg error:", e)
+
     threading.Thread(target=scheduler, daemon=True).start()
+    threading.Thread(target=poll_updates, daemon=True).start()
     port = int(os.environ.get("PORT", 10000))
     print(f"Server port {port} par chalu hai")
     HTTPServer(("0.0.0.0", port), Handler).serve_forever()
