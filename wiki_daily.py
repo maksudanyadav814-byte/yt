@@ -13,37 +13,77 @@ SEND_HOUR = int(os.environ.get("SEND_HOUR", "8"))      # IST me ghanta
 SEND_MINUTE = int(os.environ.get("SEND_MINUTE", "0"))  # IST me minute
 
 TG = f"https://api.telegram.org/bot{TOKEN}"
-WIKI = "https://en.wikipedia.org/w/api.php"
 HEADERS = {"User-Agent": "StoryVideoBot/1.0 (your_email@example.com)"}  # apna asli email
 IST = timezone(timedelta(hours=5, minutes=30))
 
-KEYWORDS = [
-    "unsolved mystery", "lost city", "ancient civilization mystery",
-    "historical biography", "missing person case", "forgotten king",
-    "famous disappearance", "historical betrayal", "ancient curse legend",
-]
+LANGS = {
+    "hi": {
+        "api": "https://hi.wikipedia.org/w/api.php",
+        "heading": "🇮🇳 हिंदी के 5 topics",
+        "skip": ("सूची", "List of"),
+        "keywords": [
+            "रहस्य", "रहस्यमयी घटना", "खोया हुआ शहर", "प्राचीन सभ्यता",
+            "ऐतिहासिक घटना", "जीवनी", "राजा का इतिहास", "विश्वासघात",
+            "रहस्यमय मृत्यु", "लापता", "किला", "युद्ध का इतिहास",
+        ],
+    },
+    "en": {
+        "api": "https://en.wikipedia.org/w/api.php",
+        "heading": "🌐 English topics (5)",
+        "skip": ("List of",),
+        "keywords": [
+            "unsolved mystery", "lost city", "ancient civilization mystery",
+            "historical biography", "missing person case", "forgotten king",
+            "famous disappearance", "historical betrayal", "ancient curse legend",
+        ],
+    },
+}
 
 last_sent_date = None
+sent_ids = {"hi": set(), "en": set()}   # restart par reset hota hai
 
 
-def get_topics(keyword, want=10):
-    items = []
-    for offset in (random.randint(0, 100), 0):
-        params = {
-            "action": "query", "format": "json",
-            "generator": "search", "gsrsearch": keyword,
-            "gsrlimit": 15, "gsroffset": offset,
-            "prop": "extracts|info", "exintro": 1, "explaintext": 1,
-            "exsentences": 2, "exlimit": 15, "inprop": "url",
-        }
-        r = requests.get(WIKI, params=params, headers=HEADERS, timeout=20)
-        r.raise_for_status()
-        pages = r.json().get("query", {}).get("pages", {})
-        items = sorted(pages.values(), key=lambda p: p.get("index", 0))
-        items = [p for p in items if not p["title"].startswith("List of")]
-        if len(items) >= want:
-            return items[:want]
-    return items
+def fetch(lang, keyword, offset):
+    params = {
+        "action": "query", "format": "json",
+        "generator": "search", "gsrsearch": keyword,
+        "gsrlimit": 15, "gsroffset": offset,
+        "prop": "extracts|info", "exintro": 1, "explaintext": 1,
+        "exsentences": 3, "exlimit": 15, "inprop": "url",
+    }
+    r = requests.get(LANGS[lang]["api"], params=params, headers=HEADERS, timeout=20)
+    r.raise_for_status()
+    pages = r.json().get("query", {}).get("pages", {})
+    return sorted(pages.values(), key=lambda p: p.get("index", 0))
+
+
+def get_topics(lang, want=5):
+    cfg = LANGS[lang]
+    keywords = cfg["keywords"][:]
+    random.shuffle(keywords)
+    picked = []
+    for kw in keywords:
+        for offset in (random.randint(0, 50), 0):
+            try:
+                items = fetch(lang, kw, offset)
+            except Exception as e:
+                print("Fetch error:", lang, kw, e)
+                continue
+            for p in items:
+                title = p["title"]
+                info = (p.get("extract") or "").strip()
+                if title.startswith(cfg["skip"]) or "बहुविकल्पी" in title or "disambiguation" in title.lower():
+                    continue
+                if len(info) < 100:                       # bahut chhote stub pages chhodo
+                    continue
+                if p["pageid"] in sent_ids[lang] or any(p["pageid"] == x["pageid"] for x in picked):
+                    continue
+                picked.append(p)
+                if len(picked) == want:
+                    return picked
+            if len(picked) >= want:
+                return picked
+    return picked
 
 
 def send(text):
@@ -54,13 +94,17 @@ def send(text):
 
 
 def send_daily_topics():
-    keyword = random.choice(KEYWORDS)
-    topics = get_topics(keyword)
-    send(f"🔎 Aaj ke 10 topics ({keyword}):")
-    for i, p in enumerate(topics, 1):
-        info = (p.get("extract") or "").strip()[:400]
-        send(f"{i}. {p['title']}\n\n{info}\n\n{p['fullurl']}")
-        time.sleep(0.5)
+    for lang in ("hi", "en"):
+        topics = get_topics(lang, 5)
+        if not topics:
+            send(f"{LANGS[lang]['heading']}: aaj kuch nahi mila.")
+            continue
+        send(f"{LANGS[lang]['heading']}")
+        for i, p in enumerate(topics, 1):
+            info = (p.get("extract") or "").strip()[:450]
+            send(f"{i}. {p['title']}\n\n{info}\n\n{p['fullurl']}")
+            sent_ids[lang].add(p["pageid"])
+            time.sleep(0.5)
 
 
 def scheduler():
@@ -95,7 +139,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_HEAD(self):
         self._ok()
 
-    def log_message(self, *args):   # har ping ka log band
+    def log_message(self, *args):
         pass
 
 
